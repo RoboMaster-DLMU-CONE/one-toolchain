@@ -1,0 +1,438 @@
+name: Build Toolchain
+
+on:
+  push:
+    tags: ['v*']
+    workflow_dispatch: 
+
+jobs:
+  build:
+    name: Build for ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          - os: windows-latest
+            arch: x86_64
+            asset_name: one-toolchain-windows-x64.zip
+            python_asset: python-3.12.x-embed-amd64.zip
+          - os: ubuntu-latest
+            arch: x86_64
+            asset_name: one-toolchain-linux-x64.tar.gz
+          - os: macos-latest
+            arch: x86_64
+            asset_name: one-toolchain-macos-x64.tar.gz
+          - os: macos-latest
+            arch: aarch64
+            asset_name: one-toolchain-macos-arm64.tar.gz
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # 1. Resolve Python asset (Windows embed or python-build-standalone)
+      - name: Resolve Python asset
+        id: resolve-python
+        uses: actions/github-script@v6
+        env:
+          MATRIX_OS: ${{ matrix.os }}
+          MATRIX_ARCH: ${{ matrix.arch }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          script: |
+            const core = require('@actions/core');
+            const github = require('@actions/github');
+            const octokit = github.getOctokit(process.env.GITHUB_TOKEN);
+            const os = (process.env.MATRIX_OS || '').toLowerCase();
+            const arch = (process.env.MATRIX_ARCH || '').toLowerCase();
+            const targetMinor = '3.12';
+            async function run() {
+              if (os.startsWith('win')) {
+                // Try to find latest CPython release for 3.12 (non-prerelease)
+                const releases = await octokit.rest.repos.listReleases({ owner: 'python', repo: 'cpython', per_page: 100 });
+                let rel = releases.data.find(r => (r.tag_name || '').startsWith('v' + targetMinor) && !r.prerelease);
+                if (!rel) {
+                  // Fallback to tags if release not found
+                  const tags = await octokit.rest.repos.listTags({ owner: 'python', repo: 'cpython', per_page: 100 });
+                  const tag = tags.data.find(t => (t.name || '').startsWith('v' + targetMinor));
+                  const version = tag ? tag.name.replace(/^v/,'') : '3.12.0';
+                  const python_key = `python-${version}-embed-amd64.zip`;
+                  const python_url = `https://www.python.org/ftp/python/${version}/${python_key}`;
+                  core.setOutput('python_key', python_key);
+                  core.setOutput('python_url', python_url);
+                  return;
+                }
+                const version = rel.tag_name.replace(/^v/,'');
+                const python_key = `python-${version}-embed-amd64.zip`;
+                const python_url = `https://www.python.org/ftp/python/${version}/${python_key}`;
+                core.setOutput('python_key', python_key);
+                core.setOutput('python_url', python_url);
+                return;
+              }
+
+              // Unix: prefer python-build-standalone assets that contain 3.12 and install_only
+              const rel = await octokit.rest.repos.getLatestRelease({ owner: 'astral-sh', repo: 'python-build-standalone' });
+              const assets = rel.data.assets || [];
+              const candidates = assets.filter(a => /install_only/.test(a.name) && a.name.includes(targetMinor));
+              const archTags = arch === 'aarch64' ? ['aarch64','arm64'] : ['amd64','x86_64','amd64'];
+              let asset = candidates.find(a => archTags.some(tag => a.name.includes(tag)) && (os.includes('mac') ? a.name.includes('darwin') : a.name.includes('linux')));
+              if (!asset) asset = candidates.find(a => os.includes('mac') ? a.name.includes('darwin') : a.name.includes('linux'));
+              if (!asset && candidates.length) asset = candidates[0];
+              if (asset) {
+                core.setOutput('python_key', asset.name);
+                core.setOutput('python_url', asset.browser_download_url);
+                return;
+              }
+
+              // Fallback: try any install_only asset (latest release)
+              const fallback = assets.filter(a => /install_only/.test(a.name));
+              let asset2 = fallback.find(a => archTags.some(tag => a.name.includes(tag)) && (os.includes('mac') ? a.name.includes('darwin') : a.name.includes('linux')));
+              if (!asset2) asset2 = fallback.find(a => os.includes('mac') ? a.name.includes('darwin') : a.name.includes('linux'));
+              if (asset2) {
+                core.setOutput('python_key', asset2.name);
+                core.setOutput('python_url', asset2.browser_download_url);
+                return;
+              }
+
+              // No asset found
+              core.setOutput('python_key', '');
+              core.setOutput('python_url', '');
+            }
+            run().catch(err => core.setFailed(err.message));
+      - name: Setup Portable Python (Windows)
+        if: ${{ startsWith(matrix.os, 'windows') }}
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $url = "${{ steps.resolve-python.outputs.python_url }}"
+          $key = "${{ steps.resolve-python.outputs.python_key }}"
+          Write-Host "Downloading $url"
+          Invoke-WebRequest -Uri $url -OutFile "$PWD\$key"
+          Expand-Archive -Path "$PWD\$key" -DestinationPath "$PWD/dist/python" -Force
+          # Find the *_pth file (e.g. python312._pth) and uncomment import site
+          $pth = Get-ChildItem -Path "$PWD/dist/python" -Filter "*_pth" -Recurse -File | Select-Object -First 1
+          if ($pth) {
+            Write-Host "PTH file: $($pth.FullName) - uncommenting import site"
+            (Get-Content $pth.FullName) -replace '^\s*#\s*import site', 'import site' | Set-Content $pth.FullName
+          } else {
+            Write-Host "No _pth file found under dist/python"
+          }
+          # Ensure pip exists by running get-pip.py
+          $gp = "$PWD/get-pip.py"
+          Invoke-WebRequest -Uri "https://bootstrap.pypa.io/get-pip.py" -OutFile $gp
+          & "$PWD/dist/python/python.exe" $gp
+          Remove-Item $gp -Force
+          # Copy local env.bat (if present in repo) into dist for packaging
+          if (Test-Path "$PWD\env.bat") {
+            Copy-Item "$PWD\env.bat" -Destination "$PWD\dist\env.bat" -Force
+          } else {
+            Write-Host "env.bat not found in repo root"
+          }
+
+      - name: Setup Portable Python (Unix)
+        if: ${{ matrix.os != 'windows-latest' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          url="${{ steps.resolve-python.outputs.python_url }}"
+          key="${{ steps.resolve-python.outputs.python_key }}"
+          mkdir -p ./dist
+          echo "Downloading $url"
+          curl -fsSL "$url" -o "./dist/$key"
+          mkdir -p ./dist/python
+          # Try common archive formats: gz, xz, zip
+          if tar -tzf "./dist/$key" >/dev/null 2>&1; then
+            tar -xzf "./dist/$key" -C ./dist/python --strip-components=1
+          elif tar -tJf "./dist/$key" >/dev/null 2>&1; then
+            tar -xJf "./dist/$key" -C ./dist/python --strip-components=1
+          else
+            unzip -q "./dist/$key" -d ./dist/python || true
+          fi
+          # Ensure python executable is available at ./dist/python/python
+          if [ -x ./dist/python/bin/python3 ]; then
+            ln -sf "$(pwd)/dist/python/bin/python3" ./dist/python/python
+          elif [ -x ./dist/python/python ]; then
+            chmod +x ./dist/python/python || true
+          elif [ -x ./dist/python/python3 ]; then
+            ln -sf "$(pwd)/dist/python/python3" ./dist/python/python
+          fi
+
+      # 2. Download and assemble Zephyr SDK (minimal + arm toolchain)
+      - name: Resolve Zephyr SDK release
+        id: resolve-sdk
+        uses: actions/github-script@v6
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          MATRIX_OS: ${{ matrix.os }}
+          MATRIX_ARCH: ${{ matrix.arch }}
+        with:
+          script: |
+            const core = require('@actions/core');
+            const github = require('@actions/github');
+            const octokit = github.getOctokit(process.env.GITHUB_TOKEN);
+            const os = (process.env.MATRIX_OS||'').toLowerCase();
+            const arch = (process.env.MATRIX_ARCH||'').toLowerCase();
+            async function run(){
+              const rels = await octokit.rest.repos.listReleases({ owner: 'zephyrproject-rtos', repo: 'sdk-ng', per_page: 100 });
+              const rel = rels.data.find(r => !r.prerelease);
+              if(!rel) return core.setFailed('No non-prerelease release found for zephyrproject-rtos/sdk-ng');
+              const tag = rel.tag_name; // e.g. v0.17.4
+              const ver = tag.replace(/^v/,'');
+              core.setOutput('sdk_tag', tag);
+              core.setOutput('sdk_ver', ver);
+              const assets = rel.assets || [];
+
+              function findAssetByName(name){
+                return assets.find(a => a.name === name) || assets.find(a => a.name && a.name.includes(name));
+              }
+
+              let minimalName = '';
+              let toolName = '';
+
+              if (os.startsWith('win')) {
+                minimalName = `zephyr-sdk-${ver}_windows-x86_64_minimal.7z`;
+                toolName = `toolchain_windows-x86_64_arm-zephyr-eabi.7z`;
+              } else if (os.includes('ubuntu') || os.includes('linux')) {
+                minimalName = `zephyr-sdk-${ver}_linux-x86_64_minimal.tar.xz`;
+                toolName = `toolchain_linux-x86_64_arm-zephyr-eabi.tar.xz`;
+              } else if (os.includes('mac')) {
+                // mac has both arch variants for minimal and toolchain
+                if (arch === 'aarch64') {
+                  minimalName = `zephyr-sdk-${ver}_macos-aarch64_minimal.tar.xz`;
+                  toolName = `toolchain_macos-aarch64_arm-zephyr-eabi.tar.xz`;
+                } else {
+                  minimalName = `zephyr-sdk-${ver}_macos-x86_64_minimal.tar.xz`;
+                  toolName = `toolchain_macos-x86_64_arm-zephyr-eabi.tar.xz`;
+                }
+              }
+
+              const minimalAsset = findAssetByName(minimalName) || assets.find(a => a.name && a.name.includes('_minimal'));
+              const toolAsset = findAssetByName(toolName) || assets.find(a => a.name && a.name.includes('toolchain') && a.name.includes('arm-zephyr-eabi'));
+
+              if (minimalAsset) {
+                core.setOutput('minimal_asset', minimalAsset.name);
+                core.setOutput('minimal_url', minimalAsset.browser_download_url);
+              } else {
+                core.setOutput('minimal_asset','');
+                core.setOutput('minimal_url','');
+              }
+              if (toolAsset) {
+                core.setOutput('tool_asset', toolAsset.name);
+                core.setOutput('tool_url', toolAsset.browser_download_url);
+              } else {
+                core.setOutput('tool_asset','');
+                core.setOutput('tool_url','');
+              }
+            }
+            run().catch(err => core.setFailed(err.message));
+
+      - name: Download and assemble Zephyr SDK (Windows)
+        if: ${{ startsWith(matrix.os, 'windows') }}
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $ver = "${{ steps.resolve-sdk.outputs.sdk_ver }}"
+          $min_url = "${{ steps.resolve-sdk.outputs.minimal_url }}"
+          $tool_url = "${{ steps.resolve-sdk.outputs.tool_url }}"
+          New-Item -ItemType Directory -Force -Path ./dist/sdk | Out-Null
+          if (-not $min_url) { Write-Host "No minimal SDK asset url found"; exit 1 }
+          Write-Host "Downloading minimal SDK: $min_url"
+          $min_file = "./dist/$(Split-Path $min_url -Leaf)"
+          Invoke-WebRequest -Uri $min_url -OutFile $min_file
+          # extract minimal (7z)
+          $seven = (Get-Command 7z.exe -ErrorAction SilentlyContinue).Source -or (Get-Command 'C:\Program Files\7-Zip\7z.exe' -ErrorAction SilentlyContinue).Source
+          if (-not $seven) { Write-Host "7z.exe not found in PATH or default install location"; exit 1 }
+          & $seven x $min_file -o"./dist/zephyr-sdk-${ver}" -y | Out-Null
+          # download toolchain
+          if (-not $tool_url) { Write-Host "No toolchain asset found"; exit 1 }
+          $tool_file = "./dist/$(Split-Path $tool_url -Leaf)"
+          Invoke-WebRequest -Uri $tool_url -OutFile $tool_file
+          # extract toolchain into tmp and move arm-zephyr-eabi under sdk folder
+          New-Item -ItemType Directory -Force -Path ./dist/tmp_tool | Out-Null
+          & $seven x $tool_file -o"./dist/tmp_tool" -y | Out-Null
+          $dir = Get-ChildItem -Path ./dist/tmp_tool -Directory | Select-Object -First 1
+          if ($dir) {
+            Move-Item -Path $dir.FullName -Destination "./dist/zephyr-sdk-${ver}\$($dir.Name)"
+          }
+
+      - name: Download and assemble Zephyr SDK (Unix)
+        if: ${{ matrix.os != 'windows-latest' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          ver="${{ steps.resolve-sdk.outputs.sdk_ver }}"
+          min_url="${{ steps.resolve-sdk.outputs.minimal_url }}"
+          tool_url="${{ steps.resolve-sdk.outputs.tool_url }}"
+          mkdir -p ./dist
+          if [ -z "$min_url" ]; then echo "No minimal SDK url found"; exit 1; fi
+          echo "Downloading minimal SDK: $min_url"
+          min_file="./dist/$(basename "$min_url")"
+          curl -fsSL "$min_url" -o "$min_file"
+          mkdir -p "./dist/zephyr-sdk-${ver}"
+          # extract minimal (tar.xz or tar.gz)
+          if tar -tJf "$min_file" >/dev/null 2>&1; then
+            tar -xJf "$min_file" -C ./dist --strip-components=1
+            # some tarballs create the folder directly; ensure moved into zephyr-sdk-${ver}
+            if [ -d "./dist/zephyr-sdk-${ver}" ]; then true; else
+              mv ./dist/* "./dist/zephyr-sdk-${ver}" || true
+            fi
+          else
+            tar -xzf "$min_file" -C ./dist || true
+          fi
+          # download toolchain
+          if [ -z "$tool_url" ]; then echo "No toolchain asset found"; exit 1; fi
+          echo "Downloading toolchain: $tool_url"
+          tool_file="./dist/$(basename "$tool_url")"
+          curl -fsSL "$tool_url" -o "$tool_file"
+          mkdir -p ./dist/tmp_tool
+          if tar -tJf "$tool_file" >/dev/null 2>&1; then
+            tar -xJf "$tool_file" -C ./dist/tmp_tool || true
+          else
+            tar -xzf "$tool_file" -C ./dist/tmp_tool || true
+          fi
+          # move the first directory from tmp_tool into the sdk folder
+          firstdir=$(find ./dist/tmp_tool -maxdepth 1 -type d ! -path './dist/tmp_tool' | head -n1)
+          if [ -n "$firstdir" ]; then
+            mv "$firstdir" "./dist/zephyr-sdk-${ver}/"
+          fi
+
+      # 3. 准备系统工具 (Windows Only)
+      - name: Setup Windows Tools
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $base = Join-Path $PWD 'dist'
+          New-Item -ItemType Directory -Force -Path $base | Out-Null
+          New-Item -ItemType Directory -Force -Path (Join-Path $base 'bin') | Out-Null
+          New-Item -ItemType Directory -Force -Path (Join-Path $base 'cmake') | Out-Null
+          New-Item -ItemType Directory -Force -Path (Join-Path $base 'gperf') | Out-Null
+          New-Item -ItemType Directory -Force -Path (Join-Path $base 'mingit') | Out-Null
+          New-Item -ItemType Directory -Force -Path (Join-Path $PWD 'dist/downloads') | Out-Null
+
+          function Download-And-Extract($url, $destDir) {
+            $uri = [uri]$url
+            $name = [System.IO.Path]::GetFileName($uri.LocalPath)
+            if ([string]::IsNullOrEmpty($name)) { $name = [Guid]::NewGuid().ToString() + '.zip' }
+            $out = Join-Path $PWD "dist/downloads/$name"
+            Write-Host "Downloading $url to $out"
+            Invoke-WebRequest -Uri $url -OutFile $out
+            Write-Host "Extracting $out to $destDir"
+            Expand-Archive -Path $out -DestinationPath $destDir -Force
+          }
+
+          # CMake
+          $cmake_url = 'https://github.com/Kitware/CMake/releases/download/v4.2.1/cmake-4.2.1-windows-x86_64.zip'
+          Download-And-Extract $cmake_url (Join-Path $base 'cmake')
+
+          # Ninja (single binary) -> place in bin
+          $ninja_url = 'https://github.com/ninja-build/ninja/releases/download/v1.13.2/ninja-win.zip'
+          $tmpNinja = Join-Path $PWD 'dist/downloads/ninja.zip'
+          Invoke-WebRequest -Uri $ninja_url -OutFile $tmpNinja
+          Expand-Archive -Path $tmpNinja -DestinationPath (Join-Path $base 'bin') -Force
+
+          # gperf
+          $gperf_url = 'https://gigenet.dl.sourceforge.net/project/gnuwin32/gperf/3.0.1/gperf-3.0.1-bin.zip?viasf=1'
+          Download-And-Extract $gperf_url (Join-Path $base 'gperf')
+
+          # MinGit
+          $mingit_url = 'https://github.com/git-for-windows/git/releases/download/v2.52.0.windows.1/MinGit-2.52.0-64-bit.zip'
+          Download-And-Extract $mingit_url (Join-Path $base 'mingit')
+
+          # wget (single binary) -> place in bin
+          $wget_url = 'https://eternallybored.org/misc/wget/releases/wget-1.21.4-win32.zip'
+          $tmpWget = Join-Path $PWD 'dist/downloads/wget.zip'
+          Invoke-WebRequest -Uri $wget_url -OutFile $tmpWget
+          Expand-Archive -Path $tmpWget -DestinationPath (Join-Path $base 'bin') -Force
+
+          # Normalize: move any executables from nested dirs into bin when appropriate
+          Get-ChildItem -Path $base -Recurse -Filter '*.exe' | ForEach-Object {
+            $target = Join-Path $base 'bin'
+            Move-Item -Path $_.FullName -Destination $target -Force
+          }
+
+          Write-Host "Windows dependencies downloaded to $base"
+
+      # 4. 离线 Wheel 包下载 (关键步骤)
+      - name: Download Offline Wheels (Windows)
+        if: ${{ startsWith(matrix.os, 'windows') }}
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Force -Path ./dist/wheels | Out-Null
+          # save requirements.txt for packaging
+          Invoke-WebRequest -Uri "https://raw.githubusercontent.com/zephyrproject-rtos/zephyr/main/scripts/requirements.txt" -OutFile "./dist/requirements.txt"
+          $py = "${{ pwd }}/dist/python/python.exe"
+          Write-Host "Using python: $py"
+          & $py -m pip install --upgrade pip setuptools wheel
+          & $py -m pip download west -r ./dist/requirements.txt -d ./dist/wheels --platform win_amd64 --python-version 312 --only-binary=:all:
+
+      - name: Download Offline Wheels (Unix)
+        if: ${{ matrix.os != 'windows-latest' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p ./dist/wheels
+          # save requirements.txt for packaging
+          curl -fsSL "https://raw.githubusercontent.com/zephyrproject-rtos/zephyr/main/scripts/requirements.txt" -o ./dist/requirements.txt
+          PY="$(pwd)/dist/python/python"
+          echo "Using python: $PY"
+          "$PY" -m pip install --upgrade pip setuptools wheel
+          arch="${{ matrix.arch }}"
+          osname="${{ matrix.os }}"
+          if [[ "${osname}" == macos* ]]; then
+            if [[ "${arch}" == "aarch64" ]]; then
+              platform="macosx_11_0_arm64"
+            else
+              platform="macosx_11_0_x86_64"
+            fi
+          else
+            platform="manylinux_2_17_x86_64"
+          fi
+          echo "Requesting wheels for platform: $platform"
+          "$PY" -m pip download west -r ./dist/requirements.txt -d ./dist/wheels --platform "$platform" --python-version 312 --only-binary=:all:
+
+      # 5. 打包
+      - name: Archive (Windows)
+        if: ${{ startsWith(matrix.os, 'windows') }}
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Write-Host "Creating ZIP artifact: ${{ matrix.asset_name }}"
+          if (Test-Path './dist') {
+            Compress-Archive -Path './dist/*' -DestinationPath "${{ matrix.asset_name }}" -Force
+          } else {
+            Write-Error "dist directory not found"
+          }
+
+      - name: Archive (Unix)
+        if: ${{ matrix.os != 'windows-latest' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "Creating tar.gz artifact: ${{ matrix.asset_name }}"
+          if [ -d ./dist ]; then
+            tar -C dist -czf "${{ matrix.asset_name }}" .
+          else
+            echo "dist directory not found" >&2
+            exit 1
+          fi
+
+      # 6. 上传 Artifact (供 Release Job 使用)
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset_name }}
+          path: ${{ matrix.asset_name }}
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+      - name: Create Release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: |
+            one-toolchain-windows-x64.zip
+            one-toolchain-linux-x64.tar.gz
+            one-toolchain-macos-x64.tar.gz
+            one-toolchain-macos-arm64.tar.gz
