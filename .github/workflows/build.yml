@@ -3,7 +3,8 @@ name: Build Toolchain
 on:
   push:
     tags: ['v*']
-    workflow_dispatch: 
+
+  workflow_dispatch: 
 
 jobs:
   build:
@@ -39,29 +40,13 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           script: |
-            const core = require('@actions/core');
-            const github = require('@actions/github');
-            const octokit = github.getOctokit(process.env.GITHUB_TOKEN);
             const os = (process.env.MATRIX_OS || '').toLowerCase();
             const arch = (process.env.MATRIX_ARCH || '').toLowerCase();
             const targetMinor = '3.12';
             async function run() {
               if (os.startsWith('win')) {
-                // Try to find latest CPython release for 3.12 (non-prerelease)
-                const releases = await octokit.rest.repos.listReleases({ owner: 'python', repo: 'cpython', per_page: 100 });
-                let rel = releases.data.find(r => (r.tag_name || '').startsWith('v' + targetMinor) && !r.prerelease);
-                if (!rel) {
-                  // Fallback to tags if release not found
-                  const tags = await octokit.rest.repos.listTags({ owner: 'python', repo: 'cpython', per_page: 100 });
-                  const tag = tags.data.find(t => (t.name || '').startsWith('v' + targetMinor));
-                  const version = tag ? tag.name.replace(/^v/,'') : '3.12.0';
-                  const python_key = `python-${version}-embed-amd64.zip`;
-                  const python_url = `https://www.python.org/ftp/python/${version}/${python_key}`;
-                  core.setOutput('python_key', python_key);
-                  core.setOutput('python_url', python_url);
-                  return;
-                }
-                const version = rel.tag_name.replace(/^v/,'');
+                // Use fixed Python 3.12.10 for Windows
+                const version = '3.12.10';
                 const python_key = `python-${version}-embed-amd64.zip`;
                 const python_url = `https://www.python.org/ftp/python/${version}/${python_key}`;
                 core.setOutput('python_key', python_key);
@@ -70,7 +55,7 @@ jobs:
               }
 
               // Unix: prefer python-build-standalone assets that contain 3.12 and install_only
-              const rel = await octokit.rest.repos.getLatestRelease({ owner: 'astral-sh', repo: 'python-build-standalone' });
+              const rel = await github.rest.repos.getLatestRelease({ owner: 'astral-sh', repo: 'python-build-standalone' });
               const assets = rel.data.assets || [];
               const candidates = assets.filter(a => /install_only/.test(a.name) && a.name.includes(targetMinor));
               const archTags = arch === 'aarch64' ? ['aarch64','arm64'] : ['amd64','x86_64','amd64'];
@@ -107,7 +92,60 @@ jobs:
           $key = "${{ steps.resolve-python.outputs.python_key }}"
           Write-Host "Downloading $url"
           Invoke-WebRequest -Uri $url -OutFile "$PWD\$key"
-          Expand-Archive -Path "$PWD\$key" -DestinationPath "$PWD/dist/python" -Force
+          Write-Host "Extracting Python embeddable zip: $key"
+          # 首先解压到临时目录
+          Expand-Archive -Path "$PWD\$key" -DestinationPath "$PWD/temp_python" -Force
+
+          # 诊断：查看临时目录内容
+          Write-Host "Contents of temp_python directory:"
+          $tempItems = Get-ChildItem "$PWD/temp_python" -Recurse
+          foreach ($item in $tempItems) {
+              if ($item.PSIsContainer) {
+                  Write-Host "  [DIR]  $($item.FullName.Replace("$PWD\temp_python\", ''))"
+              } else {
+                  Write-Host "  [FILE] $($item.Name)"
+              }
+          }
+
+          # 确保目标目录存在
+          if (!(Test-Path "$PWD/dist/python")) {
+              New-Item -ItemType Directory -Path "$PWD/dist/python" -Force | Out-Null
+          }
+
+          # 获取临时目录中的项目
+          $items = Get-ChildItem "$PWD/temp_python"
+          Write-Host "Found $($items.Count) items in temp directory"
+
+          if ($items.Count -eq 1 -and $items[0].PSIsContainer) {
+              Write-Host "Found nested directory structure, moving contents from $($items[0].Name)"
+              $sourcePath = "$PWD/temp_python/$($items[0].Name)"
+              Get-ChildItem -Path $sourcePath | Move-Item -Destination "$PWD/dist/python/" -Force
+          } else {
+              Write-Host "Direct structure found, moving all contents"
+              $sourcePath = "$PWD/temp_python"
+              Get-ChildItem -Path $sourcePath | Move-Item -Destination "$PWD/dist/python/" -Force
+          }
+
+          # 诊断：查看目标目录内容
+          Write-Host "Contents of python directory after extraction:"
+          $pythonItems = Get-ChildItem "$PWD/dist/python" -Recurse
+          foreach ($item in $pythonItems) {
+              if ($item.PSIsContainer) {
+                  Write-Host "  [DIR]  $($item.FullName.Replace("$PWD\dist\python\", ''))"
+              } else {
+                  Write-Host "  [FILE] $($item.Name)"
+              }
+          }
+
+          # 检查python.exe是否在目标目录
+          if (Test-Path "$PWD/dist/python/python.exe") {
+              Write-Host "SUCCESS: python.exe found at $PWD/dist/python/python.exe"
+          } else {
+              Write-Host "ERROR: python.exe NOT FOUND in $PWD/dist/python/"
+          }
+
+          # 清理临时目录
+          Remove-Item "$PWD/temp_python" -Recurse -Force
           # Find the *_pth file (e.g. python312._pth) and uncomment import site
           $pth = Get-ChildItem -Path "$PWD/dist/python" -Filter "*_pth" -Recurse -File | Select-Object -First 1
           if ($pth) {
@@ -166,13 +204,10 @@ jobs:
           MATRIX_ARCH: ${{ matrix.arch }}
         with:
           script: |
-            const core = require('@actions/core');
-            const github = require('@actions/github');
-            const octokit = github.getOctokit(process.env.GITHUB_TOKEN);
             const os = (process.env.MATRIX_OS||'').toLowerCase();
             const arch = (process.env.MATRIX_ARCH||'').toLowerCase();
             async function run(){
-              const rels = await octokit.rest.repos.listReleases({ owner: 'zephyrproject-rtos', repo: 'sdk-ng', per_page: 100 });
+              const rels = await github.rest.repos.listReleases({ owner: 'zephyrproject-rtos', repo: 'sdk-ng', per_page: 100 });
               const rel = rels.data.find(r => !r.prerelease);
               if(!rel) return core.setFailed('No non-prerelease release found for zephyrproject-rtos/sdk-ng');
               const tag = rel.tag_name; // e.g. v0.17.4
@@ -345,7 +380,8 @@ jobs:
           Expand-Archive -Path $tmpWget -DestinationPath (Join-Path $base 'bin') -Force
 
           # Normalize: move any executables from nested dirs into bin when appropriate
-          Get-ChildItem -Path $base -Recurse -Filter '*.exe' | ForEach-Object {
+          $pythonDir = Join-Path $base 'python'
+          Get-ChildItem -Path $base -Recurse -Filter '*.exe' | Where-Object { $_.FullName -notlike "$pythonDir*" } | ForEach-Object {
             $target = Join-Path $base 'bin'
             Move-Item -Path $_.FullName -Destination $target -Force
           }
@@ -353,43 +389,56 @@ jobs:
           Write-Host "Windows dependencies downloaded to $base"
 
       # 4. 离线 Wheel 包下载 (关键步骤)
-      - name: Download Offline Wheels (Windows)
+      - name: Create Offline Wheels (Windows)
         if: ${{ startsWith(matrix.os, 'windows') }}
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
           New-Item -ItemType Directory -Force -Path ./dist/wheels | Out-Null
-          # save requirements.txt for packaging
-          Invoke-WebRequest -Uri "https://raw.githubusercontent.com/zephyrproject-rtos/zephyr/main/scripts/requirements.txt" -OutFile "./dist/requirements.txt"
-          $py = "${{ pwd }}/dist/python/python.exe"
-          Write-Host "Using python: $py"
-          & $py -m pip install --upgrade pip setuptools wheel
-          & $py -m pip download west -r ./dist/requirements.txt -d ./dist/wheels --platform win_amd64 --python-version 312 --only-binary=:all:
 
-      - name: Download Offline Wheels (Unix)
+          # 下载 requirements 文件
+          $reqs = @("requirements.txt", "requirements-base.txt", "requirements-build-test.txt", "requirements-run-test.txt", "requirements-extras.txt", "requirements-compliance.txt")
+          foreach ($r in $reqs) {
+              Invoke-WebRequest -Uri "https://raw.githubusercontent.com/zephyrproject-rtos/zephyr/main/scripts/$r" -OutFile "./dist/$r"
+          }
+
+          $distDir = "${{ github.workspace }}\dist"
+          $pythonDir = Join-Path $distDir "python"
+
+          # 由于压缩包中确实有python.exe，我们需要使用正确路径
+          $pythonCmd = Join-Path $pythonDir "python.exe"
+
+          # 1. 确保 pip wheel 自身是最新的
+          & $pythonCmd -m pip install --upgrade pip setuptools wheel poetry-core
+
+          # 2. 【核心修改】使用 pip wheel 而不是 pip download
+          # 不指定 --platform, 不指定 --python-version (使用原生环境)
+          # 这会自动把源码包编译成 wheel
+          & $pythonCmd -m pip wheel west -r ./dist/requirements.txt -w ./dist/wheels
+
+      - name: Create Offline Wheels (Unix)
         if: ${{ matrix.os != 'windows-latest' }}
         shell: bash
         run: |
           set -euo pipefail
           mkdir -p ./dist/wheels
-          # save requirements.txt for packaging
-          curl -fsSL "https://raw.githubusercontent.com/zephyrproject-rtos/zephyr/main/scripts/requirements.txt" -o ./dist/requirements.txt
-          PY="$(pwd)/dist/python/python"
+
+          # 下载 requirements 文件
+          base_url="https://raw.githubusercontent.com/zephyrproject-rtos/zephyr/main/scripts"
+          for r in requirements.txt requirements-base.txt requirements-build-test.txt requirements-run-test.txt requirements-extras.txt requirements-compliance.txt; do
+              curl -fsSL "$base_url/$r" -o "./dist/$r"
+          done
+
+          PY="${{ github.workspace }}/dist/python/python"
           echo "Using python: $PY"
-          "$PY" -m pip install --upgrade pip setuptools wheel
-          arch="${{ matrix.arch }}"
-          osname="${{ matrix.os }}"
-          if [[ "${osname}" == macos* ]]; then
-            if [[ "${arch}" == "aarch64" ]]; then
-              platform="macosx_11_0_arm64"
-            else
-              platform="macosx_11_0_x86_64"
-            fi
-          else
-            platform="manylinux_2_17_x86_64"
-          fi
-          echo "Requesting wheels for platform: $platform"
-          "$PY" -m pip download west -r ./dist/requirements.txt -d ./dist/wheels --platform "$platform" --python-version 312 --only-binary=:all:
+
+          # 1. 确保构建工具就位
+          "$PY" -m pip install --upgrade pip setuptools wheel poetry-core
+
+          # 2. 【核心修改】使用 pip wheel
+          # 移除 --platform 和 --python-version 限制
+          # 让它利用 Runner 的环境编译出完美的 Wheel
+          "$PY" -m pip wheel west -r ./dist/requirements.txt -w ./dist/wheels
 
       # 5. 打包
       - name: Archive (Windows)
