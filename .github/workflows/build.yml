@@ -268,26 +268,46 @@ jobs:
           $ver = "${{ steps.resolve-sdk.outputs.sdk_ver }}"
           $min_url = "${{ steps.resolve-sdk.outputs.minimal_url }}"
           $tool_url = "${{ steps.resolve-sdk.outputs.tool_url }}"
-          New-Item -ItemType Directory -Force -Path ./dist/sdk | Out-Null
+          $sdkRoot = Join-Path $PWD 'dist/sdk'
+          New-Item -ItemType Directory -Force -Path $sdkRoot | Out-Null
           if (-not $min_url) { Write-Host "No minimal SDK asset url found"; exit 1 }
           Write-Host "Downloading minimal SDK: $min_url"
-          $min_file = "./dist/$(Split-Path $min_url -Leaf)"
+          $min_file = Join-Path $PWD "dist/$(Split-Path $min_url -Leaf)"
           Invoke-WebRequest -Uri $min_url -OutFile $min_file
           # extract minimal (7z)
           $seven = (Get-Command 7z.exe -ErrorAction SilentlyContinue).Source -or (Get-Command 'C:\Program Files\7-Zip\7z.exe' -ErrorAction SilentlyContinue).Source
           if (-not $seven) { Write-Host "7z.exe not found in PATH or default install location"; exit 1 }
-          & $seven x $min_file -o"./dist/zephyr-sdk-${ver}" -y | Out-Null
+          $resolvedMin = (Resolve-Path $min_file).Path
+          Add-Content -Path $env:GITHUB_ENV -Value "MIN_SDK_ARCHIVE=$resolvedMin"
+          & $seven x $resolvedMin -o"$sdkRoot" -y | Out-Null
+          $sdkDir = Join-Path $sdkRoot "zephyr-sdk-$ver"
+          if (-not (Test-Path $sdkDir)) {
+            $candidate = Get-ChildItem -Path $sdkRoot -Directory | Where-Object { $_.Name -like 'zephyr-sdk-*' } | Select-Object -First 1
+            if ($candidate) {
+              Move-Item -Path $candidate.FullName -Destination $sdkDir -Force
+            } else {
+              Write-Host "No zephyr-sdk-* directory found, creating $sdkDir and moving extracted contents"
+              New-Item -ItemType Directory -Force -Path $sdkDir | Out-Null
+              Get-ChildItem -Path $sdkRoot | Where-Object { $_.FullName -ne $sdkDir } | ForEach-Object {
+                Move-Item -Path $_.FullName -Destination $sdkDir -Force
+              }
+            }
+          }
           # download toolchain
           if (-not $tool_url) { Write-Host "No toolchain asset found"; exit 1 }
-          $tool_file = "./dist/$(Split-Path $tool_url -Leaf)"
+          $tool_file = Join-Path $PWD "dist/$(Split-Path $tool_url -Leaf)"
           Invoke-WebRequest -Uri $tool_url -OutFile $tool_file
           # extract toolchain into tmp and move arm-zephyr-eabi under sdk folder
-          New-Item -ItemType Directory -Force -Path ./dist/tmp_tool | Out-Null
-          & $seven x $tool_file -o"./dist/tmp_tool" -y | Out-Null
-          $dir = Get-ChildItem -Path ./dist/tmp_tool -Directory | Select-Object -First 1
+          $resolvedTool = (Resolve-Path $tool_file).Path
+          Add-Content -Path $env:GITHUB_ENV -Value "TOOL_SDK_ARCHIVE=$resolvedTool"
+          $tmpTool = Join-Path $PWD 'dist/tmp_tool'
+          New-Item -ItemType Directory -Force -Path $tmpTool | Out-Null
+          & $seven x $resolvedTool -o"$tmpTool" -y | Out-Null
+          $dir = Get-ChildItem -Path $tmpTool -Directory | Select-Object -First 1
           if ($dir) {
-            Move-Item -Path $dir.FullName -Destination "./dist/zephyr-sdk-${ver}\$($dir.Name)"
+            Move-Item -Path $dir.FullName -Destination (Join-Path $sdkDir $dir.Name) -Force
           }
+          Remove-Item $tmpTool -Recurse -Force
 
       - name: Download and assemble Zephyr SDK (Unix)
         if: ${{ matrix.os != 'windows-latest' }}
@@ -302,33 +322,48 @@ jobs:
           echo "Downloading minimal SDK: $min_url"
           min_file="./dist/$(basename "$min_url")"
           curl -fsSL "$min_url" -o "$min_file"
-          mkdir -p "./dist/zephyr-sdk-${ver}"
+          sdk_root="./dist/sdk"
+          mkdir -p "$sdk_root"
+          min_abs="$(cd "$(dirname "$min_file")" && pwd)/$(basename "$min_file")"
+          echo "MIN_SDK_ARCHIVE=$min_abs" >> "$GITHUB_ENV"
           # extract minimal (tar.xz or tar.gz)
           if tar -tJf "$min_file" >/dev/null 2>&1; then
-            tar -xJf "$min_file" -C ./dist --strip-components=1
-            # some tarballs create the folder directly; ensure moved into zephyr-sdk-${ver}
-            if [ -d "./dist/zephyr-sdk-${ver}" ]; then true; else
-              mv ./dist/* "./dist/zephyr-sdk-${ver}" || true
-            fi
+            tar -xJf "$min_file" -C "$sdk_root"
           else
-            tar -xzf "$min_file" -C ./dist || true
+            tar -xzf "$min_file" -C "$sdk_root" || true
           fi
+          sdk_dir="$sdk_root/zephyr-sdk-${ver}"
+          if [ ! -d "$sdk_dir" ]; then
+            candidate=$(find "$sdk_root" -maxdepth 1 -type d -name 'zephyr-sdk-*' | head -n1)
+            if [ -n "$candidate" ]; then
+              mv "$candidate" "$sdk_dir"
+            else
+              echo "No zephyr-sdk-* directory found; creating $sdk_dir and moving extracted contents"
+              mkdir -p "$sdk_dir"
+              find "$sdk_root" -mindepth 1 -maxdepth 1 ! -path "$sdk_dir" -exec mv {} "$sdk_dir/" \;
+            fi
+          fi
+          rm -f "$sdk_dir"/zephyr-sdk-*hosttools-standalone*.sh 2>/dev/null || true
           # download toolchain
           if [ -z "$tool_url" ]; then echo "No toolchain asset found"; exit 1; fi
           echo "Downloading toolchain: $tool_url"
           tool_file="./dist/$(basename "$tool_url")"
           curl -fsSL "$tool_url" -o "$tool_file"
-          mkdir -p ./dist/tmp_tool
+          tool_abs="$(cd "$(dirname "$tool_file")" && pwd)/$(basename "$tool_file")"
+          echo "TOOL_SDK_ARCHIVE=$tool_abs" >> "$GITHUB_ENV"
+          tmp_tool="./dist/tmp_tool"
+          mkdir -p "$tmp_tool"
           if tar -tJf "$tool_file" >/dev/null 2>&1; then
-            tar -xJf "$tool_file" -C ./dist/tmp_tool || true
+            tar -xJf "$tool_file" -C "$tmp_tool" || true
           else
-            tar -xzf "$tool_file" -C ./dist/tmp_tool || true
+            tar -xzf "$tool_file" -C "$tmp_tool" || true
           fi
           # move the first directory from tmp_tool into the sdk folder
-          firstdir=$(find ./dist/tmp_tool -maxdepth 1 -type d ! -path './dist/tmp_tool' | head -n1)
+          firstdir=$(find "$tmp_tool" -maxdepth 1 -type d ! -path "$tmp_tool" | head -n1)
           if [ -n "$firstdir" ]; then
-            mv "$firstdir" "./dist/zephyr-sdk-${ver}/"
+            mv "$firstdir" "$sdk_dir/"
           fi
+          rm -rf "$tmp_tool"
 
       # 3. 准备系统工具 (Windows Only)
       - name: Setup Windows Tools
@@ -358,6 +393,12 @@ jobs:
           # CMake
           $cmake_url = 'https://github.com/Kitware/CMake/releases/download/v4.2.1/cmake-4.2.1-windows-x86_64.zip'
           Download-And-Extract $cmake_url (Join-Path $base 'cmake')
+          $cmakeRoot = Join-Path $base 'cmake'
+          $cmakeDirs = Get-ChildItem -Path $cmakeRoot -Directory
+          if ($cmakeDirs.Count -eq 1 -and $cmakeDirs[0].Name -like 'cmake-*') {
+            Get-ChildItem -Path $cmakeDirs[0].FullName | Move-Item -Destination $cmakeRoot -Force
+            Remove-Item $cmakeDirs[0].FullName -Recurse -Force
+          }
 
           # Ninja (single binary) -> place in bin
           $ninja_url = 'https://github.com/ninja-build/ninja/releases/download/v1.13.2/ninja-win.zip'
@@ -378,13 +419,6 @@ jobs:
           $tmpWget = Join-Path $PWD 'dist/downloads/wget.zip'
           Invoke-WebRequest -Uri $wget_url -OutFile $tmpWget
           Expand-Archive -Path $tmpWget -DestinationPath (Join-Path $base 'bin') -Force
-
-          # Normalize: move any executables from nested dirs into bin when appropriate
-          $pythonDir = Join-Path $base 'python'
-          Get-ChildItem -Path $base -Recurse -Filter '*.exe' | Where-Object { $_.FullName -notlike "$pythonDir*" } | ForEach-Object {
-            $target = Join-Path $base 'bin'
-            Move-Item -Path $_.FullName -Destination $target -Force
-          }
 
           Write-Host "Windows dependencies downloaded to $base"
 
@@ -415,6 +449,7 @@ jobs:
           # 不指定 --platform, 不指定 --python-version (使用原生环境)
           # 这会自动把源码包编译成 wheel
           & $pythonCmd -m pip wheel west -r ./dist/requirements.txt -w ./dist/wheels
+          Get-ChildItem -Path "./dist" -Filter "requirements*.txt" | Remove-Item -Force
 
       - name: Create Offline Wheels (Unix)
         if: ${{ matrix.os != 'windows-latest' }}
@@ -439,6 +474,7 @@ jobs:
           # 移除 --platform 和 --python-version 限制
           # 让它利用 Runner 的环境编译出完美的 Wheel
           "$PY" -m pip wheel west -r ./dist/requirements.txt -w ./dist/wheels
+          rm -f ./dist/requirements*.txt
 
       # 5. 打包
       - name: Archive (Windows)
@@ -447,6 +483,14 @@ jobs:
         run: |
           $ErrorActionPreference = 'Stop'
           Write-Host "Creating ZIP artifact: ${{ matrix.asset_name }}"
+          if (Test-Path './dist/downloads') {
+            Remove-Item './dist/downloads' -Recurse -Force
+          }
+          foreach ($path in @($env:MIN_SDK_ARCHIVE, $env:TOOL_SDK_ARCHIVE)) {
+            if ($path -and (Test-Path $path)) {
+              Remove-Item $path -Force
+            }
+          }
           if (Test-Path './dist') {
             Compress-Archive -Path './dist/*' -DestinationPath "${{ matrix.asset_name }}" -Force
           } else {
@@ -459,6 +503,9 @@ jobs:
         run: |
           set -euo pipefail
           echo "Creating tar.gz artifact: ${{ matrix.asset_name }}"
+          rm -rf ./dist/downloads 2>/dev/null || true
+          if [ -n "${MIN_SDK_ARCHIVE:-}" ] && [ -f "$MIN_SDK_ARCHIVE" ]; then rm -f "$MIN_SDK_ARCHIVE"; fi
+          if [ -n "${TOOL_SDK_ARCHIVE:-}" ] && [ -f "$TOOL_SDK_ARCHIVE" ]; then rm -f "$TOOL_SDK_ARCHIVE"; fi
           if [ -d ./dist ]; then
             tar -C dist -czf "${{ matrix.asset_name }}" .
           else
