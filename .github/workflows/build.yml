@@ -16,16 +16,20 @@ jobs:
           - os: windows-latest
             arch: x86_64
             asset_name: one-toolchain-windows-x64.zip
+            artifact_name: one-toolchain-windows-x64
             python_asset: python-3.12.x-embed-amd64.zip
           - os: ubuntu-latest
             arch: x86_64
             asset_name: one-toolchain-linux-x64.tar.gz
+            artifact_name: one-toolchain-linux-x64
           - os: macos-latest
             arch: x86_64
             asset_name: one-toolchain-macos-x64.tar.gz
+            artifact_name: one-toolchain-macos-x64
           - os: macos-latest
             arch: aarch64
             asset_name: one-toolchain-macos-arm64.tar.gz
+            artifact_name: one-toolchain-macos-arm64
 
     steps:
       - uses: actions/checkout@v4
@@ -162,8 +166,9 @@ jobs:
           # Copy local env.bat (if present in repo) into dist for packaging
           if (Test-Path "$PWD\env.bat") {
             Copy-Item "$PWD\env.bat" -Destination "$PWD\dist\env.bat" -Force
-          } else {
-            Write-Host "env.bat not found in repo root"
+          }
+          if (Test-Path "$PWD\setup.cmd") {
+            Copy-Item "$PWD\setup.cmd" -Destination "$PWD\dist\setup.cmd" -Force
           }
 
       - name: Setup Portable Python (Unix)
@@ -196,8 +201,10 @@ jobs:
           fi
           if [ -f ./env.sh ]; then
             cp ./env.sh ./dist/env.sh
-          else
-            echo "env.sh not found in repo root"
+          fi
+          if [ -f ./setup.sh ]; then
+            cp ./setup.sh ./dist/setup.sh
+            chmod +x ./dist/setup.sh
           fi
 
       # 2. Download and assemble Zephyr SDK (minimal + arm toolchain)
@@ -288,13 +295,29 @@ jobs:
           if (-not $seven) { Write-Host "7z.exe not found in PATH or default install location"; exit 1 }
           $resolvedMin = (Resolve-Path $min_file).Path
           Add-Content -Path $env:GITHUB_ENV -Value "MIN_SDK_ARCHIVE=$resolvedMin"
-          $sdkDir = Join-Path $sdkRoot "zephyr-sdk-$ver"
-          if (Test-Path $sdkDir) { Remove-Item $sdkDir -Recurse -Force }
-          New-Item -ItemType Directory -Force -Path $sdkDir | Out-Null
-          & $seven x $resolvedMin "-o$sdkDir" -y | Out-Null
+          
+          # Extract to temp dir to handle potential nested structure
+          $tempSdkDir = Join-Path $PWD 'dist/temp_sdk'
+          if (Test-Path $tempSdkDir) { Remove-Item $tempSdkDir -Recurse -Force }
+          New-Item -ItemType Directory -Force -Path $tempSdkDir | Out-Null
+          
+          & $seven x $resolvedMin "-o$tempSdkDir" -y | Out-Null
           if ($LASTEXITCODE -ne 0) {
             throw "7z extraction of $resolvedMin failed with exit code $LASTEXITCODE"
           }
+
+          $sdkDir = Join-Path $sdkRoot "zephyr-sdk-$ver"
+          if (Test-Path $sdkDir) { Remove-Item $sdkDir -Recurse -Force }
+
+          $extractedDir = Get-ChildItem -Path $tempSdkDir -Directory | Where-Object { $_.Name -like "zephyr-sdk-*" } | Select-Object -First 1
+          if ($extractedDir) {
+             Write-Host "Moving extracted SDK from $($extractedDir.FullName) to $sdkDir"
+             Move-Item -Path $extractedDir.FullName -Destination $sdkDir
+          } else {
+             throw "Could not find zephyr-sdk-* directory in minimal archive"
+          }
+          Remove-Item $tempSdkDir -Recurse -Force
+
           Get-ChildItem -Path $sdkDir -Filter 'zephyr-sdk-*hosttools-standalone*.sh' -Recurse -ErrorAction SilentlyContinue | Remove-Item -Force
           if (-not (Get-ChildItem -Path $sdkDir -Recurse -File -ErrorAction SilentlyContinue | Select-Object -First 1)) {
           Write-Host "Extraction produced no files; listing ${sdkDir}:"
@@ -470,7 +493,6 @@ jobs:
           # 不指定 --platform, 不指定 --python-version (使用原生环境)
           # 这会自动把源码包编译成 wheel
           & $pythonCmd -m pip wheel west -r ./dist/requirements.txt -w ./dist/wheels
-          Get-ChildItem -Path "./dist" -Filter "requirements*.txt" | Remove-Item -Force
 
       - name: Create Offline Wheels (Unix)
         if: ${{ matrix.os != 'windows-latest' }}
@@ -495,50 +517,30 @@ jobs:
           # 移除 --platform 和 --python-version 限制
           # 让它利用 Runner 的环境编译出完美的 Wheel
           "$PY" -m pip wheel west -r ./dist/requirements.txt -w ./dist/wheels
-          rm -f ./dist/requirements*.txt
 
-      # 5. 打包
-      - name: Archive (Windows)
+      # 5. 清理临时文件
+      - name: Cleanup (Windows)
         if: ${{ startsWith(matrix.os, 'windows') }}
         shell: pwsh
         run: |
-          $ErrorActionPreference = 'Stop'
-          Write-Host "Creating ZIP artifact: ${{ matrix.asset_name }}"
-          if (Test-Path './dist/downloads') {
-            Remove-Item './dist/downloads' -Recurse -Force
-          }
+          if (Test-Path './dist/downloads') { Remove-Item './dist/downloads' -Recurse -Force }
           foreach ($path in @($env:MIN_SDK_ARCHIVE, $env:TOOL_SDK_ARCHIVE)) {
-            if ($path -and (Test-Path $path)) {
-              Remove-Item $path -Force
-            }
-          }
-          if (Test-Path './dist') {
-            Compress-Archive -Path './dist/*' -DestinationPath "${{ matrix.asset_name }}" -Force
-          } else {
-            Write-Error "dist directory not found"
+            if ($path -and (Test-Path $path)) { Remove-Item $path -Force }
           }
 
-      - name: Archive (Unix)
+      - name: Cleanup (Unix)
         if: ${{ matrix.os != 'windows-latest' }}
         shell: bash
         run: |
-          set -euo pipefail
-          echo "Creating tar.gz artifact: ${{ matrix.asset_name }}"
           rm -rf ./dist/downloads 2>/dev/null || true
           if [ -n "${MIN_SDK_ARCHIVE:-}" ] && [ -f "$MIN_SDK_ARCHIVE" ]; then rm -f "$MIN_SDK_ARCHIVE"; fi
           if [ -n "${TOOL_SDK_ARCHIVE:-}" ] && [ -f "$TOOL_SDK_ARCHIVE" ]; then rm -f "$TOOL_SDK_ARCHIVE"; fi
-          if [ -d ./dist ]; then
-            tar -C dist -czf "${{ matrix.asset_name }}" .
-          else
-            echo "dist directory not found" >&2
-            exit 1
-          fi
 
-      # 6. 上传 Artifact (供 Release Job 使用)
+      # 6. 上传 Artifact (目录)
       - uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.asset_name }}
-          path: ${{ matrix.asset_name }}
+          name: ${{ matrix.artifact_name }}
+          path: dist
 
   release:
     needs: build
@@ -546,13 +548,25 @@ jobs:
     steps:
       - uses: actions/download-artifact@v4
         with:
-          path: ./release-artifacts
-          merge-multiple: true
+          path: ./artifacts
+
+      - name: Package Assets
+        run: |
+          mkdir -p release-assets
+          for dir in artifacts/*; do
+            if [ -d "$dir" ]; then
+              name=$(basename "$dir")
+              echo "Packaging $name..."
+              if [[ "$name" == *"windows"* ]]; then
+                (cd "$dir" && zip -r -q "../../release-assets/${name}.zip" .)
+              else
+                (cd "$dir" && tar -czf "../../release-assets/${name}.tar.gz" .)
+              fi
+            fi
+          done
+          ls -l release-assets
+
       - name: Create Release
         uses: softprops/action-gh-release@v1
         with:
-          files: |
-            release-artifacts/one-toolchain-windows-x64.zip
-            release-artifacts/one-toolchain-linux-x64.tar.gz
-            release-artifacts/one-toolchain-macos-x64.tar.gz
-            release-artifacts/one-toolchain-macos-arm64.tar.gz
+          files: release-assets/*
