@@ -185,6 +185,7 @@ jobs:
           else
             unzip -q "./dist/$key" -d ./dist/python || true
           fi
+          rm -f "./dist/$key"
           # Ensure python executable is available at ./dist/python/python
           if [ -x ./dist/python/bin/python3 ]; then
             ln -sf "$(pwd)/dist/python/bin/python3" ./dist/python/python
@@ -192,6 +193,11 @@ jobs:
             chmod +x ./dist/python/python || true
           elif [ -x ./dist/python/python3 ]; then
             ln -sf "$(pwd)/dist/python/python3" ./dist/python/python
+          fi
+          if [ -f ./env.sh ]; then
+            cp ./env.sh ./dist/env.sh
+          else
+            echo "env.sh not found in repo root"
           fi
 
       # 2. Download and assemble Zephyr SDK (minimal + arm toolchain)
@@ -275,23 +281,25 @@ jobs:
           $min_file = Join-Path $PWD "dist/$(Split-Path $min_url -Leaf)"
           Invoke-WebRequest -Uri $min_url -OutFile $min_file
           # extract minimal (7z)
-          $seven = (Get-Command 7z.exe -ErrorAction SilentlyContinue).Source -or (Get-Command 'C:\Program Files\7-Zip\7z.exe' -ErrorAction SilentlyContinue).Source
+          $seven = (Get-Command 7z.exe -ErrorAction SilentlyContinue)?.Source
+          if (-not $seven -and (Test-Path 'C:\Program Files\7-Zip\7z.exe')) {
+            $seven = 'C:\Program Files\7-Zip\7z.exe'
+          }
           if (-not $seven) { Write-Host "7z.exe not found in PATH or default install location"; exit 1 }
           $resolvedMin = (Resolve-Path $min_file).Path
           Add-Content -Path $env:GITHUB_ENV -Value "MIN_SDK_ARCHIVE=$resolvedMin"
-          & $seven x $resolvedMin -o"$sdkRoot" -y | Out-Null
           $sdkDir = Join-Path $sdkRoot "zephyr-sdk-$ver"
-          if (-not (Test-Path $sdkDir)) {
-            $candidate = Get-ChildItem -Path $sdkRoot -Directory | Where-Object { $_.Name -like 'zephyr-sdk-*' } | Select-Object -First 1
-            if ($candidate) {
-              Move-Item -Path $candidate.FullName -Destination $sdkDir -Force
-            } else {
-              Write-Host "No zephyr-sdk-* directory found, creating $sdkDir and moving extracted contents"
-              New-Item -ItemType Directory -Force -Path $sdkDir | Out-Null
-              Get-ChildItem -Path $sdkRoot | Where-Object { $_.FullName -ne $sdkDir } | ForEach-Object {
-                Move-Item -Path $_.FullName -Destination $sdkDir -Force
-              }
-            }
+          if (Test-Path $sdkDir) { Remove-Item $sdkDir -Recurse -Force }
+          New-Item -ItemType Directory -Force -Path $sdkDir | Out-Null
+          & $seven x $resolvedMin "-o$sdkDir" -y | Out-Null
+          if ($LASTEXITCODE -ne 0) {
+            throw "7z extraction of $resolvedMin failed with exit code $LASTEXITCODE"
+          }
+          Get-ChildItem -Path $sdkDir -Filter 'zephyr-sdk-*hosttools-standalone*.sh' -Recurse -ErrorAction SilentlyContinue | Remove-Item -Force
+          if (-not (Get-ChildItem -Path $sdkDir -Recurse -File -ErrorAction SilentlyContinue | Select-Object -First 1)) {
+          Write-Host "Extraction produced no files; listing ${sdkDir}:"
+          Get-ChildItem -Path $sdkDir -Force | ForEach-Object { Write-Host "  $($_.FullName)" }
+          throw "Zephyr SDK directory ${sdkDir} is empty after extracting $resolvedMin"
           }
           # download toolchain
           if (-not $tool_url) { Write-Host "No toolchain asset found"; exit 1 }
@@ -302,7 +310,13 @@ jobs:
           Add-Content -Path $env:GITHUB_ENV -Value "TOOL_SDK_ARCHIVE=$resolvedTool"
           $tmpTool = Join-Path $PWD 'dist/tmp_tool'
           New-Item -ItemType Directory -Force -Path $tmpTool | Out-Null
-          & $seven x $resolvedTool -o"$tmpTool" -y | Out-Null
+          Push-Location $tmpTool
+          & $seven x $resolvedTool "-o$tmpTool" -y | Out-Null
+          $toolExit = $LASTEXITCODE
+          Pop-Location
+          if ($toolExit -ne 0) {
+            throw "7z extraction of $resolvedTool failed with exit code $toolExit"
+          }
           $dir = Get-ChildItem -Path $tmpTool -Directory | Select-Object -First 1
           if ($dir) {
             Move-Item -Path $dir.FullName -Destination (Join-Path $sdkDir $dir.Name) -Force
@@ -326,23 +340,30 @@ jobs:
           mkdir -p "$sdk_root"
           min_abs="$(cd "$(dirname "$min_file")" && pwd)/$(basename "$min_file")"
           echo "MIN_SDK_ARCHIVE=$min_abs" >> "$GITHUB_ENV"
+          tmp_sdk_extract="./dist/tmp_sdk_extract"
+          rm -rf "$tmp_sdk_extract"
+          mkdir -p "$tmp_sdk_extract"
           # extract minimal (tar.xz or tar.gz)
           if tar -tJf "$min_file" >/dev/null 2>&1; then
-            tar -xJf "$min_file" -C "$sdk_root"
+            tar -xJf "$min_file" -C "$tmp_sdk_extract"
           else
-            tar -xzf "$min_file" -C "$sdk_root" || true
+            tar -xzf "$min_file" -C "$tmp_sdk_extract" || true
+          fi
+          extracted=$(find "$tmp_sdk_extract" -maxdepth 1 -type d -name 'zephyr-sdk-*' | head -n1 || true)
+          if [ -z "$extracted" ]; then
+            echo "No zephyr-sdk-* directory found in $tmp_sdk_extract. Contents:"
+            find "$tmp_sdk_extract" -maxdepth 1 -mindepth 1 -print || true
+            extracted="$tmp_sdk_extract/zephyr-sdk-${ver}"
+            rm -rf "$extracted"
+            mkdir -p "$extracted"
+            find "$tmp_sdk_extract" -mindepth 1 -maxdepth 1 ! -path "$extracted" -exec mv {} "$extracted/" \;
           fi
           sdk_dir="$sdk_root/zephyr-sdk-${ver}"
-          if [ ! -d "$sdk_dir" ]; then
-            candidate=$(find "$sdk_root" -maxdepth 1 -type d -name 'zephyr-sdk-*' | head -n1)
-            if [ -n "$candidate" ]; then
-              mv "$candidate" "$sdk_dir"
-            else
-              echo "No zephyr-sdk-* directory found; creating $sdk_dir and moving extracted contents"
-              mkdir -p "$sdk_dir"
-              find "$sdk_root" -mindepth 1 -maxdepth 1 ! -path "$sdk_dir" -exec mv {} "$sdk_dir/" \;
-            fi
-          fi
+          rm -rf "$sdk_dir"
+          mkdir -p "$(dirname "$sdk_dir")"
+          mv "$extracted" "$sdk_dir"
+          rm -f "$sdk_dir"/zephyr-sdk-*hosttools-standalone*.sh 2>/dev/null || true
+          rm -rf "$tmp_sdk_extract"
           rm -f "$sdk_dir"/zephyr-sdk-*hosttools-standalone*.sh 2>/dev/null || true
           # download toolchain
           if [ -z "$tool_url" ]; then echo "No toolchain asset found"; exit 1; fi
@@ -524,11 +545,14 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
+        with:
+          path: ./release-artifacts
+          merge-multiple: true
       - name: Create Release
         uses: softprops/action-gh-release@v1
         with:
           files: |
-            one-toolchain-windows-x64.zip
-            one-toolchain-linux-x64.tar.gz
-            one-toolchain-macos-x64.tar.gz
-            one-toolchain-macos-arm64.tar.gz
+            release-artifacts/one-toolchain-windows-x64.zip
+            release-artifacts/one-toolchain-linux-x64.tar.gz
+            release-artifacts/one-toolchain-macos-x64.tar.gz
+            release-artifacts/one-toolchain-macos-arm64.tar.gz
