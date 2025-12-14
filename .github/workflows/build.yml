@@ -150,11 +150,11 @@ jobs:
 
           # 清理临时目录
           Remove-Item "$PWD/temp_python" -Recurse -Force
-          # Find the *_pth file (e.g. python312._pth) and uncomment import site
+          # Find the *_pth file (e.g. python312._pth) and remove it to enable standard site-packages behavior
           $pth = Get-ChildItem -Path "$PWD/dist/python" -Filter "*_pth" -Recurse -File | Select-Object -First 1
           if ($pth) {
-            Write-Host "PTH file: $($pth.FullName) - uncommenting import site"
-            (Get-Content $pth.FullName) -replace '^\s*#\s*import site', 'import site' | Set-Content $pth.FullName
+            Write-Host "Removing PTH file: $($pth.FullName)"
+            Remove-Item $pth.FullName -Force
           } else {
             Write-Host "No _pth file found under dist/python"
           }
@@ -169,6 +169,9 @@ jobs:
           }
           if (Test-Path "$PWD\setup.cmd") {
             Copy-Item "$PWD\setup.cmd" -Destination "$PWD\dist\setup.cmd" -Force
+          }
+          if (Test-Path "$PWD\env.ps1") {
+            Copy-Item "$PWD\env.ps1" -Destination "$PWD\dist\env.ps1" -Force
           }
 
       - name: Setup Portable Python (Unix)
